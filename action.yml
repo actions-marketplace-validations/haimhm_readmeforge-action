@@ -1,0 +1,152 @@
+name: "ReadmeForge — README sync"
+description: "Keeps README.md in sync with code changes. Thin client: all AI work and license checks happen in the ReadmeForge API."
+author: "ReadmeForge"
+
+branding:
+  icon: "book-open"
+  color: "blue"
+
+inputs:
+  api-url:
+    description: "ReadmeForge API sync endpoint"
+    required: false
+    default: "https://readmeforge-api.readmeforge.workers.dev/v1/sync"
+  license-key:
+    description: "ReadmeForge Pro license key (from Gumroad). Optional. Unlocks private repos + 1000 syncs/month."
+    required: false
+    default: ""
+  mode:
+    description: "'pr' (default) opens a pull request with the README update for review; 'commit' pushes directly to the branch (Pro)."
+    required: false
+    default: "pr"
+  readme-path:
+    description: "Path to the README file in the repo"
+    required: false
+    default: "README.md"
+  github-token:
+    description: "Token used to push branches and open PRs"
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  updated:
+    description: "'true' if the README was changed by this run"
+    value: ${{ steps.sync.outputs.updated }}
+  tier:
+    description: "API tier used for this run: free | pro"
+    value: ${{ steps.sync.outputs.tier }}
+  pr-url:
+    description: "URL of the opened pull request (mode=pr only)"
+    value: ${{ steps.sync.outputs.pr-url }}
+
+runs:
+  using: "composite"
+  steps:
+    - id: sync
+      shell: bash
+      env:
+        RF_API_URL: ${{ inputs.api-url }}
+        RF_LICENSE_KEY: ${{ inputs.license-key }}
+        RF_MODE: ${{ inputs.mode }}
+        RF_README_PATH: ${{ inputs.readme-path }}
+        RF_REPO: ${{ github.repository }}
+        RF_PRIVATE: ${{ github.event.repository.private }}
+        RF_REF_NAME: ${{ github.ref_name }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        API_URL="${RF_API_URL:-https://readmeforge-api.readmeforge.workers.dev/v1/sync}"
+        README_PATH="${RF_README_PATH:-README.md}"
+        MODE="${RF_MODE:-pr}"
+
+        if [[ "$MODE" != "pr" && "$MODE" != "commit" ]]; then
+          echo "::error::mode must be 'pr' or 'commit'"
+          exit 1
+        fi
+
+        # --- collect the diff for this push (handles first push: before = all zeros) ---
+        BEFORE="${{ github.event.before }}"
+        SHA="${{ github.sha }}"
+        EMPTY_TREE="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+        if [[ "$BEFORE" =~ ^0+$ ]]; then
+          RANGE="$EMPTY_TREE $SHA"
+        else
+          RANGE="$BEFORE $SHA"
+        fi
+        DIFF="$(git diff --no-color --no-ext-diff $RANGE -- . 2>/dev/null || true)"
+        if [[ -z "${DIFF//[[:space:]]/}" ]]; then
+          echo "No changes detected; nothing to sync."
+          echo "updated=false" >> "$GITHUB_OUTPUT"
+          echo "tier=free" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # --- current README (may not exist yet) ---
+        if [[ -f "$README_PATH" ]]; then
+          README_CONTENT="$(cat "$README_PATH")"
+        else
+          README_CONTENT=""
+        fi
+
+        if [[ "$RF_PRIVATE" == "true" ]]; then VISIBILITY="private"; else VISIBILITY="public"; fi
+
+        # --- call the ReadmeForge API (no AI key needed in the repo) ---
+        PAYLOAD="$(jq -n \
+          --arg repo "$RF_REPO" \
+          --arg visibility "$VISIBILITY" \
+          --arg diff "$DIFF" \
+          --arg readme "$README_CONTENT" \
+          --arg license_key "$RF_LICENSE_KEY" \
+          '{repo:$repo, visibility:$visibility, diff:$diff, readme:$readme} +
+           (if $license_key == "" then {} else {license_key:$license_key} end)')"
+
+        RESPONSE="$(curl -sS -m 180 -X POST "$API_URL" \
+          -H 'Content-Type: application/json' \
+          -d "$PAYLOAD")"
+
+        ERR="$(echo "$RESPONSE" | jq -r '.error // empty')"
+        if [[ -n "$ERR" ]]; then
+          echo "::error::ReadmeForge API error: $ERR"
+          echo "$RESPONSE" | jq -r '.hint // empty' | sed 's/^/hint: /'
+          exit 1
+        fi
+
+        TIER="$(echo "$RESPONSE" | jq -r '.tier')"
+        echo "$RESPONSE" | jq -r '.readme' > "$README_PATH"
+        echo "Changelog:"
+        echo "$RESPONSE" | jq -r '.changelog[]? | "- \(.)"'
+
+        if git diff --quiet -- "$README_PATH"; then
+          echo "README unchanged; nothing to commit."
+          echo "updated=false" >> "$GITHUB_OUTPUT"
+          echo "tier=$TIER" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "updated=true" >> "$GITHUB_OUTPUT"
+        echo "tier=$TIER" >> "$GITHUB_OUTPUT"
+
+        git config user.name "readmeforge[bot]"
+        git config user.email "readmeforge[bot]@users.noreply.github.com"
+
+        if [[ "$MODE" == "pr" ]]; then
+          # Review-first: push a branch and open a PR (safe default, works on free tier).
+          BRANCH="readmeforge/sync-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH"
+          git add "$README_PATH"
+          git commit -m "docs: sync README with code changes [skip readmeforge]"
+          git push origin "$BRANCH"
+          PR_URL="$(gh pr create \
+            --title "docs: sync README with code changes" \
+            --body "Automated README sync by ReadmeForge. Review the diff, then merge." \
+            --head "$BRANCH" --base "$RF_REF_NAME")"
+          echo "Opened PR: $PR_URL"
+          echo "pr-url=$PR_URL" >> "$GITHUB_OUTPUT"
+        else
+          # Direct commit (intended for Pro). The [skip readmeforge] marker prevents
+          # the workflow from re-triggering itself — see README for the `if:` guard.
+          git add "$README_PATH"
+          git commit -m "docs: sync README with code changes [skip readmeforge]"
+          git push
+          echo "Committed README update directly."
+        fi
